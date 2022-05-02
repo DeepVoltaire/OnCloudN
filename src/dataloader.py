@@ -7,7 +7,9 @@ from .datasets import LoadTifDataset
 def get_dataloaders(hps):
     """Builds datasets and dataloaders for training/validation"""
     df = pd.read_pickle(hps.df_path)
+    # df = df.iloc[:500]
     num_workers = 8
+    bands = ["B02", "B03", "B04", "B08"]  # , "B01", "B09", "B11", "B12"]
 
     ## Setup the correct image and label paths
     df["img_path"] = df["B02_path"].copy()
@@ -19,6 +21,8 @@ def get_dataloaders(hps):
     val_dataset = LoadTifDataset(
         img_paths_val,
         mask_paths_val,
+        bands=bands,
+        extra_bands=hps.extra_bands,
         val=val,
         test=test,
     )
@@ -32,54 +36,16 @@ def get_dataloaders(hps):
     ## Building the training dataset and dataloader
     # Data Augmentations
     train_transforms = get_train_transforms(hps)
+    train_img_transforms = get_train_img_transforms(hps)
     print(f"Train Data Augmentations: {train_transforms}")
+    print(f"Train Image Data Augmentations: {train_img_transforms}")
     print("#" * 100)
-
-    # img_paths_train, mask_paths_train, weights_all =  [], [], []
-
-    # total_weight_gt = df[(df["fold"] != hps.fold_nb) & (df["batch"] == "sen1floods11_gt_rechip")].shape[0]
-
-    # for batch, batch_name in zip(BATCH_DF_NAMES, BATCH_NAMES):
-    #     df_batch = df[(df["fold"] != hps.fold_nb) & (df["batch"] == batch)].copy()
-    #     if not len(df_batch):
-    #         warnings.warn(f"No training examples for batch {batch}, skipping")
-    #         continue
-
-    #     img_paths_batch = df_batch["img_path"].tolist()
-    #     mask_paths_batch = df_batch["label_path"].tolist()
-
-    #     df_batch["weights"] = 1
-    #     gt_to_batch_weight_ratio = get_weight_ratio(hps, batch)
-    #     if gt_to_batch_weight_ratio == 0:  # skip this batch
-    #         continue
-
-    #     weights_batch = (
-    #         df_batch["weights"] * (1 / gt_to_batch_weight_ratio) * (total_weight_gt / len(img_paths_batch))
-    #     ).tolist()
-    #     weights_batches[batch_name] = weights_batch
-    #     weights_all.extend(weights_batches[batch_name])
-
-    #     total_weight_batch = sum(weights_batch)
-    #     gt_to_batch_ratio_real = total_weight_gt / total_weight_batch
-
-    #     img_paths_train.extend(img_paths_batch)
-    #     gsw_paths_train.extend(df_batch["gsw_label_path"].tolist())
-    #     mask_paths_train.extend(mask_paths_batch)
-    #     biomes_train.extend(df_batch["biome_reduced"].tolist())
-    #     dem_paths_train.extend(df_batch["dem_path"].tolist())
-    #     lcc_paths_train.extend(df_batch["lcc_path"].tolist())
-
-    #     if not np.isclose(gt_to_batch_ratio_real, gt_to_batch_weight_ratio):
-    #         raise ValueError(
-    #             f"{batch_name} is {gt_to_batch_ratio_real:.2f} and should be {gt_to_batch_weight_ratio:.2f}"
-    #         )
-    #     print(
-    #         f"Total {batch_name:25} weight: {sum(weights_batch):6.1f} for {len(weights_batch):6} images "
-    #         f"({sum(weights_batch) / len(weights_batch):.3f} average weight)"
-    #     )
     img_paths_train = df.loc[df["fold"] != hps.fold_nb, "img_path"].tolist()
     mask_paths_train = df.loc[df["fold"] != hps.fold_nb, "label_path"].tolist()
-    weights_all = [1] * len(img_paths_train)  # np.full(len(img_paths_train), 1)
+    if "weight" in df.columns:
+        weights_all = df.loc[df["fold"] != hps.fold_nb, "weight"].tolist()
+    else:
+        weights_all = [1] * len(img_paths_train)  # np.full(len(img_paths_train), 1)
 
     print("#" * 100)
     print(f"Fold {hps.fold_nb} --> Train: {len(img_paths_train)}, Val: {len(val_dataset)}")
@@ -98,10 +64,14 @@ def get_dataloaders(hps):
     train_dataset = LoadTifDataset(
         img_paths_train,
         mask_paths_train,
+        bands=bands,
+        extra_bands=hps.extra_bands,
+        transforms_only_img=albumentations.Compose(train_img_transforms),
         transforms=albumentations.Compose(train_transforms),
     )
 
     # weights = [1] * len(weights_all) # for debugging
+    print(f"Last 5 sample weights: {weights_all[-5:]}")
     weights_all = torch.Tensor(weights_all)
     weights_all = weights_all.double()
     msg = (
@@ -158,3 +128,19 @@ def get_train_transforms(hps):
             )
         )
     return train_transforms
+
+
+def get_train_img_transforms(hps):
+    """Returns train transforms using information from hps"""
+    train_img_transforms = []
+    if hps.da_brightness_magnitude or hps.da_contrast_magnitude:
+        train_img_transforms.append(
+            albumentations.RandomBrightnessContrast(
+                brightness_limit=hps.da_brightness_magnitude,
+                contrast_limit=hps.da_contrast_magnitude,
+                brightness_by_max=True,
+                always_apply=False,
+                p=1.0,
+            )
+        )
+    return train_img_transforms

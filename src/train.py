@@ -8,6 +8,8 @@ import numpy as np
 import pytz
 import torch
 import yaml
+import matplotlib.pyplot as plt
+from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
 
 torch.backends.cudnn.benchmark = True
 import datetime
@@ -16,12 +18,12 @@ import logging
 sys.path.extend(["../", "../.."])
 
 from .model import build_model
-from .data_augmentation import gpu_da
-from .loss import XEDiceLoss
+from .data_augmentation import gpu_da, rand_bbox
+from .loss import XEDiceLoss, XELovaszLoss
 from .metrics import AverageMeter, Metrics
 
 
-def train(hps, train_loader, val_loader):
+def train(hps, train_loader, val_loader, visualize_cutmix=False):
     """
     Trains a single or multi class segmentation model given a hps and a train and val_loader.
     """
@@ -56,15 +58,24 @@ def train(hps, train_loader, val_loader):
 
     # Initialize model, loss, optimizer and lr schedule
     model = build_model(hps)
+
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     logging.info(f"Training with {torch.cuda.device_count()} GPUS")
 
-    loss_func = loss_func = XEDiceLoss(
-        alpha=hps.alpha,
-        num_classes=hps.num_classes,
-        ignore_index=255,
-    )
+    if hps.loss == "focal":
+        loss_func = FocalLoss(mode="multiclass", ignore_index=255)
+    elif hps.loss == "lovasz":
+        loss_func = XELovaszLoss(ignore_index=255)
+        # loss_func = LovaszLoss(mode="multiclass", ignore_index=255)
+    elif hps.loss == "xedice":
+        loss_func = XEDiceLoss(
+            alpha=hps.alpha,
+            num_classes=hps.num_classes,
+            ignore_index=255,
+        )
+    else:
+        raise ValueError(f"Unknown loss: {hps.loss}")
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=hps.lr * torch.cuda.device_count(), weight_decay=hps.weight_decay
@@ -83,6 +94,16 @@ def train(hps, train_loader, val_loader):
     if hps.use_fp16:
         scaler = torch.cuda.amp.GradScaler()
         logging.info(f"Training is done with mixed precision")
+
+    if len(hps.resume) > 0:
+        checkpoint = torch.load(hps.resume, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("Resume checkpoint %s" % hps.resume)
+        if "optim_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optim_state_dict"])
+
+    if hps.cutmix_alpha > 0:
+        logging.info(f"Using Cutmix with alpha {hps.cutmix_alpha}")
 
     save_dict = {"model_name": hps.name, "model_time": curr_time, "hps": attr.asdict(hps)}
     best_metric, best_metric_epoch = -1, 0
@@ -105,6 +126,49 @@ def train(hps, train_loader, val_loader):
             x_data = data["image"].to(device="cuda", non_blocking=True)
             targets = data["mask"].long().to(device="cuda", non_blocking=True)
 
+            if hps.cutmix_alpha > 0:
+                lam_label = np.random.beta(hps.cutmix_alpha, hps.cutmix_alpha)
+                rand_index_label = torch.randperm(x_data.size()[0]).cuda()
+
+                if visualize_cutmix:
+                    f, axarr = plt.subplots(1, 8, figsize=(30, 8))
+                    ax_nb = 0
+                    for idx1, idx2 in enumerate(rand_index_label[:2]):
+                        axarr[ax_nb].imshow(x_data[idx1][0].cpu().numpy())
+                        axarr[ax_nb].set_title(f"Index {idx1} Image")
+                        axarr[ax_nb + 1].imshow(targets[idx1].cpu().numpy())
+                        axarr[ax_nb + 1].set_title(f"Index {idx1} Mask")
+
+                        axarr[ax_nb + 2].imshow(x_data[idx2][0].cpu().numpy())
+                        axarr[ax_nb + 2].set_title(f"Index {idx2} Image")
+                        axarr[ax_nb + 3].imshow(targets[idx2].cpu().numpy())
+                        axarr[ax_nb + 3].set_title(f"Index {idx2} Mask")
+                        ax_nb += 4
+                    plt.tight_layout()
+                    plt.show()
+
+                bbx1, bby1, bbx2, bby2 = rand_bbox(x_data.size(), lam_label)
+
+                x_data[:, :, bbx1:bbx2, bby1:bby2] = x_data[rand_index_label, :, bbx1:bbx2, bby1:bby2]
+                targets[:, bbx1:bbx2, bby1:bby2] = targets[rand_index_label, bbx1:bbx2, bby1:bby2]
+
+                if visualize_cutmix:
+                    f, axarr = plt.subplots(1, 4, figsize=(30, 8))
+                    ax_nb = 0
+                    for idx1, idx2 in enumerate(rand_index_label[:2]):
+                        axarr[ax_nb].imshow(x_data[idx1][0].cpu().numpy())
+                        axarr[ax_nb].set_title(f"Index {idx1} mixed with {idx2} Image")
+                        axarr[ax_nb + 1].imshow(targets[idx1].cpu().numpy())
+                        axarr[ax_nb + 1].set_title(f"Index {idx1} mixed with {idx2} Mask")
+                        ax_nb += 2
+                    plt.tight_layout()
+                    plt.show()
+
+                    print(rand_index_label, bbx1, bby1, bbx2, bby2)
+                    import pdb
+
+                    pdb.set_trace()
+
             start = time.time()
             if hps.gpu_da_params[0] != 0:
                 x_data, targets = gpu_da(x_data, targets, hps.gpu_da_params)
@@ -114,6 +178,9 @@ def train(hps, train_loader, val_loader):
             if hps.use_fp16:
                 with torch.cuda.amp.autocast():
                     preds = model(x_data)
+                    # if hps.loss == "focal":
+                    #     loss = loss_func(preds[:, 1], targets)
+                    # else:
                     loss = loss_func(preds, targets)
 
                 # Scales loss. Calls backward() on scaled loss to create scaled gradients.

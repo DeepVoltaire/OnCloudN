@@ -7,23 +7,42 @@ import pandas as pd
 from PIL import Image
 import torch
 import typer
+import numpy as np
+import tifffile
+import segmentation_models_pytorch as smp
 
-try:
-    from src.datasets import LoadTifDataset
-    from src.model import build_model
-except ImportError:
-    from benchmark_src.datasets import LoadTifDataset
-    from benchmark_src.model import build_model
-
+#### DRIVENDATA
 ROOT_DIRECTORY = Path("/codeexecution")
 PREDICTIONS_DIRECTORY = ROOT_DIRECTORY / "predictions"
 ASSETS_DIRECTORY = ROOT_DIRECTORY / "assets"
 DATA_DIRECTORY = ROOT_DIRECTORY / "data"
 INPUT_IMAGES_DIRECTORY = DATA_DIRECTORY / "test_features"
 
+# ###### LOCAL TESTING
+# ROOT_DIRECTORY = Path("benchmark_src")
+# DATA_DIRECTORY = Path("data")
+# PREDICTIONS_DIRECTORY = ROOT_DIRECTORY / "predictions"
+# ASSETS_DIRECTORY = ROOT_DIRECTORY / "assets"
+# INPUT_IMAGES_DIRECTORY = DATA_DIRECTORY / "test_features"
+
 # Set the pytorch cache directory and include cached models in your submission.zip
 os.environ["TORCH_HOME"] = str(ASSETS_DIRECTORY / "assets/torch")
 
+class TestDataset(torch.utils.data.Dataset):
+    def __init__(self, img_paths):
+        self.img_paths = img_paths
+
+    def __getitem__(self, idx):
+        arr_x = tifffile.imread([self.img_paths[idx].replace("B02.tif", f"B0{k}.tif") for k in [2, 3, 4, 8]])
+        arr_x = np.nan_to_num(arr_x)
+        arr_x = (arr_x / 2 ** 16).astype(np.float32)
+
+        sample = {"image": arr_x}
+        sample["chip_id"] = self.img_paths[idx].split("/")[-2]
+        return sample
+
+    def __len__(self):
+        return len(self.img_paths)
 
 def get_metadata(features_dir, bands):
     """
@@ -47,7 +66,7 @@ def get_metadata(features_dir, bands):
     return chip_metadata.transpose().reset_index().rename(columns={"index": "chip_id"})
 
 
-def make_predictions(model, x_paths, bands, predictions_dir):
+def make_predictions(models, x_paths, bands, predictions_dir):
     """Predicts cloud cover and saves results to the predictions directory.
 
     Args:
@@ -57,21 +76,24 @@ def make_predictions(model, x_paths, bands, predictions_dir):
         bands (list[str]): list of bands provided for each chip
         predictions_dir (os.PathLike): Destination directory to save the predicted TIF masks
     """
-    test_dataset = LoadTifDataset(img_paths=x_paths, mask_paths=None, test=True)
+#     print(x_paths)
+    test_dataset = TestDataset(img_paths=x_paths)
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=model.batch_size,
-        num_workers=model.num_workers,
+        batch_size=14,
+        num_workers=4,
         shuffle=False,
         pin_memory=True,
     )
-
+    torch.set_grad_enabled(False)
     for batch_index, batch in enumerate(test_dataloader):
         logger.debug(f"Predicting batch {batch_index} of {len(test_dataloader)}")
-        x = batch["chip"]
-        preds = model.forward(x)
-        preds = torch.softmax(preds, dim=1)[:, 1]
-        preds = (preds > 0.5).detach().numpy().astype("uint8")
+        x = batch["image"].cuda(non_blocking=True)
+        preds = torch.softmax(models[0](x), dim=1)[:, 1]
+        for model_nb in range(1, len(models)):
+            preds += torch.softmax(models[model_nb](x), dim=1)[:, 1]
+        preds /= len(models)
+        preds = (preds > 0.45).cpu().numpy().astype("uint8")
         for chip_id, pred in zip(batch["chip_id"], preds):
             chip_pred_path = predictions_dir / f"{chip_id}.tif"
             chip_pred_im = Image.fromarray(pred)
@@ -79,11 +101,14 @@ def make_predictions(model, x_paths, bands, predictions_dir):
 
 
 def main(
-    model_weights_path: Path = ASSETS_DIRECTORY / "cloud_model.pt",
+    experiment_names=["Exp4"] * 5  + ["Exp8_3"] * 5 + ["Exp11-0"] * 5 + ["Exp7-3"] * 5, # + ["Exp4-1"] * 5,
+    fold_list=[0, 1, 2, 3, 4] * 4,
+#     experiment_names=["Exp10-0"] * 5,
+#     fold_list=[0, 1, 2, 3, 4] * 1,
+    trained_models_dir: Path = ASSETS_DIRECTORY,
     test_features_dir: Path = DATA_DIRECTORY / "test_features",
     predictions_dir: Path = PREDICTIONS_DIRECTORY,
     bands: List[str] = ["B02", "B03", "B04", "B08"],
-    fast_dev_run: bool = False,
 ):
     """
     Generate predictions for the chips in test_features_dir using the model saved at
@@ -93,7 +118,7 @@ def main(
     the structure of the code execution runtime.
 
     Args:
-        model_weights_path (os.PathLike): Path to the weights of a trained CloudModel.
+        hps_paths: Path to the model hyperparameters.
         test_features_dir (os.PathLike, optional): Path to the features for the test data. Defaults
             to 'data/test_features' in the same directory as main.py
         predictions_dir (os.PathLike, optional): Destination directory to save the predicted TIF masks
@@ -106,21 +131,24 @@ def main(
         )
     os.makedirs(predictions_dir, exist_ok=True)
 
-    logger.info("Loading model")
-    model = CloudModel(bands=bands, hparams={"weights": None})
-    model.load_state_dict(torch.load(model_weights_path))
-
+    models = []
+    for experiment_name, fold_nb in zip(experiment_names, fold_list):
+        jit_model_path = f"{trained_models_dir}/CNN-{experiment_name}_fold{fold_nb}_jit.pt"
+        if not os.path.exists(jit_model_path):
+            raise ValueError(f"Model path {jit_model_path} not found.")
+        model = torch.jit.load(jit_model_path)
+        model.eval()
+        model = model.cuda()
+        models.append(model)
+        logger.info(f"Using {jit_model_path}")
+    
     logger.info("Loading test metadata")
     test_metadata = get_metadata(test_features_dir, bands=bands)
-    if fast_dev_run:
-        test_metadata = test_metadata.head()
     logger.info(f"Found {len(test_metadata)} chips")
 
     logger.info("Generating predictions in batches")
-    make_predictions(model, test_metadata, bands, predictions_dir)
-
+    make_predictions(models, test_metadata["B02_path"].tolist(), bands, predictions_dir)
     logger.info(f"""Saved {len(list(predictions_dir.glob("*.tif")))} predictions""")
-
 
 if __name__ == "__main__":
     typer.run(main)

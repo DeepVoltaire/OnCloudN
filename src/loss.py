@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
+
 
 EPS = 1e-7
 
@@ -18,7 +20,7 @@ class XEDiceLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, preds, targets):
-        xe_loss = self.xe(preds, targets)
+        xe_loss = self.xe(preds, targets) if self.alpha != 0 else 0
         dice_loss = 0
         no_ignore = targets.ne(self.ignore_index)
         targets = targets.masked_select(no_ignore)
@@ -39,3 +41,29 @@ class XEDiceLoss(nn.Module):
 
     def get_name(self):
         return "XEDiceLoss"
+
+
+class XELovaszLoss(nn.Module):
+    """
+    Mixture of alpha * CrossEntropy and (1 - alpha) * LovaszLoss.
+    """
+
+    def __init__(self, alpha=0.5, num_classes=1, debug=False, ignore_index=255):
+        super().__init__()
+        self.xe = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.lovasz = LovaszLoss(mode="multiclass", ignore_index=ignore_index)
+        self.alpha = alpha
+        self.num_classes = num_classes
+        self.debug = debug
+        self.ignore_index = ignore_index
+
+    def forward(self, preds, targets):
+        xe_loss = self.xe(preds, targets) if self.alpha != 0 else 0
+        lovasz_loss = self.lovasz(preds, targets)
+        # if self.debug:
+        print(f"Lovasz: {lovasz_loss:.3f}, XE: {xe_loss:.3f}")
+
+        return self.alpha * xe_loss + (1 - self.alpha) * lovasz_loss
+
+    def get_name(self):
+        return "XELovaszLoss"

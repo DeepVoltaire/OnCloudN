@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import tifffile
 import matplotlib.pyplot as plt
-import time
 
 
 class LoadTifDataset(torch.utils.data.Dataset):
@@ -10,6 +9,9 @@ class LoadTifDataset(torch.utils.data.Dataset):
         self,
         img_paths,
         mask_paths,
+        bands=["B02", "B03", "B04", "B08"],
+        extra_bands=[],
+        transforms_only_img=None,
         transforms=None,
         val=False,
         test=False,
@@ -19,6 +21,7 @@ class LoadTifDataset(torch.utils.data.Dataset):
         Args:
             img_paths (list of str): Paths to the input B02 path.
             mask_paths (list of str): Paths to the labels for the S2 images.
+            transforms_only_img (albumentation.transforms, optional): Transforms to apply to the images only. Defaults to None.
             transforms (albumentation.transforms, optional): Transforms to apply to the images/masks. Defaults to None.
             val (bool, optional): If True, this dataset is used for validation.
                 Defaults to False.
@@ -26,22 +29,27 @@ class LoadTifDataset(torch.utils.data.Dataset):
         """
         self.img_paths = img_paths
         self.mask_paths = mask_paths
+        self.bands = bands
+        self.extra_bands = extra_bands
         self.transforms = transforms
+        self.transforms_only_img = transforms_only_img
         self.val = val
         self.test = test
 
     def __getitem__(self, idx):
         sample = {}
         # Load in image
-        arr_x = tifffile.imread([self.img_paths[idx].replace("B02.tif", f"B0{k}.tif") for k in [2, 3, 4, 8]])
+        img_path_list = []
+        for band in self.bands:
+            img_path_list.append(self.img_paths[idx].replace("B02.tif", f"{band}.tif"))
+        for band in self.extra_bands:
+            img_path_list.append(self.img_paths[idx].replace("B02.tif", f"{band}_resized512.tif"))
+        arr_x = tifffile.imread(img_path_list)
 
         if arr_x.shape[0] < 20:
             arr_x = arr_x.transpose((1, 2, 0))
 
         arr_x = np.nan_to_num(arr_x)
-
-        arr_x = (arr_x / 2 ** 16).astype(np.float32)
-
         sample["image"] = arr_x
 
         # Load in and preprocess label mask
@@ -54,9 +62,16 @@ class LoadTifDataset(torch.utils.data.Dataset):
             if sample["image"].shape[0] < 20:
                 sample["image"] = sample["image"].transpose((1, 2, 0))
             sample = self.transforms(image=sample["image"], mask=sample["mask"])
+        if self.transforms_only_img:
+            if sample["image"].shape[0] < 20:
+                sample["image"] = sample["image"].transpose((1, 2, 0))
+            sample["image"] = self.transforms_only_img(image=sample["image"])["image"]
         if sample["image"].shape[-1] < 20:
             sample["image"] = sample["image"].transpose((2, 0, 1))
 
+        sample["image"] = (sample["image"] / 2 ** 16).astype(np.float32)
+
+        sample["chip_id"] = self.img_paths[idx].split("/")[-2]
         return sample
 
     def __len__(self):
@@ -76,8 +91,7 @@ class LoadTifDataset(torch.utils.data.Dataset):
             sample = self.__getitem__(rand_int)
             print(self.img_paths[rand_int], rand_int)
             print(self.mask_paths[rand_int])
-            fig_cols = 3
-            f, axarr = plt.subplots(1, fig_cols, figsize=(30, 12))
+            f, axarr = plt.subplots(1, 3, figsize=(30, 12))
 
             img_string = "S2"
             arr_x = tifffile.imread([self.img_paths[rand_int].replace("B02.tif", f"B0{k}.tif") for k in [2, 3, 4]])
@@ -85,13 +99,17 @@ class LoadTifDataset(torch.utils.data.Dataset):
                 arr_x = arr_x.transpose((1, 2, 0))
             axarr[0].imshow(scale_S2_img(arr_x))
 
-            img = sample["image"]
+            img = sample["image"] * 2 ** 16
             axarr[0].set_title(f"{img_string} Image")  # . Min: {img.min():.4f}, Max: {img.max():.4f}")
-            axarr[1].imshow(img[0] * 2 ** 16)
-            axarr[1].set_title(f"Min: {img[:-1].min():.4f}, Max: {img[:-1].max():.4f}", fontsize=15)
+            # axarr[1].imshow(arr_x[:, :, 0])
+            # axarr[1].set_title(f"Min: {arr_x[:, :, 0].min():.0f}, Max: {arr_x[:, :, 0].max():.0f}", fontsize=15)
+            axarr[1].imshow(img[0])
+            axarr[1].set_title(
+                f"Mean: {img[0].mean():.0f}, Min: {img[0].min():.0f}, Max: {img[0].max():.0f}", fontsize=15
+            )
 
             if "mask" in sample.keys():
-                axarr[2].imshow(img[0] * 2 ** 16)
+                axarr[2].imshow(img[0])
                 mask = sample["mask"]
                 print(f"Mask unique values: {np.unique(mask)}")
                 axarr[2].set_title(f"Mask==1 px: {(mask == 1).sum()}", fontsize=15)
@@ -104,8 +122,9 @@ def scale_S2_img(matrix, min_values=None, max_values=None):
     """Returns a scaled (H,W,D) image which is more easily visually inspectable. Image is linearly scaled between
     min and max_value of by channel"""
     w, h, d = matrix.shape
-    min_values = np.array([100, 100, 100])
-    max_values = np.array([2500, 2500, 2500])
+    if min_values is None:
+        min_values = np.array([100, 100, 100])
+        max_values = np.array([3500, 3500, 3500])
 
     matrix = np.reshape(matrix, [w * h, d]).astype(np.float64)
     matrix = (matrix - min_values[None, :]) / (max_values[None, :] - min_values[None, :])
